@@ -33,10 +33,13 @@
 /*********************************************************************
  * INCLUDES
  */
+#include <stdio.h>
 #include <string.h>
-
+#include <stdlib.h>
 //#define xdc_runtime_Log_DISABLE_ALL 1  // Add to disable logs from this file
 
+
+#include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Task.h>
 #include <ti/sysbios/knl/Semaphore.h>
 #include <ti/sysbios/knl/Queue.h>
@@ -46,9 +49,11 @@
 
 #include <xdc/runtime/Log.h>
 #include <xdc/runtime/Diags.h>
+#include <xdc/runtime/System.h>
 
 #include <ti/drivers/ADC.h>
-
+#include <ti/drivers/ADCBuf.h>
+#include <ti/drivers/UART.h>
 // Stack headers
 #include <hci_tl.h>
 #include <gap.h>
@@ -348,6 +353,7 @@ static ADCServiceCBs_t user_ADC_ServiceCBs =
 };
 
 
+
 /*********************************************************************
  * PUBLIC FUNCTIONS
  */
@@ -372,13 +378,16 @@ void ProjectZero_createTask(void)
   Task_construct(&przTask, ProjectZero_taskFxn, &taskParams, NULL);
 
   Task_Params ADCtaskParams;
+
   Task_Params_init(&ADCtaskParams);
-  //ADCtaskParams.stack = ADCprzTaskStack;
-  ADCtaskParams.stackSize = 400;
+  ADCtaskParams.stack = ADCprzTaskStack;
+  ADCtaskParams.stackSize = 800;
   ADCtaskParams.priority = PRZ_TASK_PRIORITY;
 
   //Task_construct(&ADCprzTask, ADCUpdate, &ADCtaskParams, NULL);
   Task_create(ADCUpdate, &ADCtaskParams, NULL);
+
+
 }
 
 /*
@@ -562,6 +571,67 @@ static void ProjectZero_init(void)
 
   // Register for GATT local events and ATT Responses pending for transmission
   GATT_RegisterForMsgs(selfEntity);
+}
+
+
+// adcbuf vars
+#define ADCBUFFERSIZE    (10)
+
+uint16_t sampleBufferOne[ADCBUFFERSIZE];
+uint16_t sampleBufferTwo[ADCBUFFERSIZE];
+uint32_t microVoltBuffer[ADCBUFFERSIZE];
+uint32_t buffersCompletedCounter = 0;
+char uartTxBuffer[10*ADCBUFFERSIZE + 25];
+
+    UART_Handle uart;
+
+
+void adcBufCallback(ADCBuf_Handle handle, ADCBuf_Conversion *conversion,
+    void *completedADCBuffer, uint32_t completedChannel) {
+    static uint_fast16_t i;
+    uint_fast16_t j;
+    uint_fast16_t uartTxBufferOffset;
+    i++;
+
+    /* Adjust raw adc values and convert them to microvolts */
+    ADCBuf_adjustRawValues(handle, completedADCBuffer, ADCBUFFERSIZE,
+        completedChannel);
+    ADCBuf_convertAdjustedToMicroVolts(handle, completedChannel,
+        completedADCBuffer, microVoltBuffer, ADCBUFFERSIZE);
+    //uint8_t* output = (uint8_t*)calloc(1000, sizeof(uint8_t));
+    //print_in(microVoltBuffer, Data_String);
+    //ltoa(i, Data_String);
+
+    //free(output);
+    /*
+     * Start with a header message and convert each entry in the current buffer
+     * to a human-readable format
+     */
+    /*uartTxBufferOffset = System_sprintf(uartTxBuffer,
+        "\r\nBuffer %u finished:\n\r", buffersCompletedCounter++);*/
+    uartTxBufferOffset = System_sprintf(uartTxBuffer,
+            "\0", buffersCompletedCounter++);
+    uint32_t temp = 0;
+    for (j = 0; j < ADCBUFFERSIZE; j++) {
+        temp = microVoltBuffer[j]/100000;
+        uartTxBufferOffset += System_sprintf(uartTxBuffer + uartTxBufferOffset,
+            "%d,", temp);
+        //uartTxBufferOffset += System_sprintf(uartTxBuffer + uartTxBufferOffset,
+        //           "\r\n%d,%d", temp / 10,temp % 10);
+        //((long long int*)completedADCBuffer)
+    }
+    //uartTxBuffer[uartTxBufferOffset] = ';';
+
+    ADCService_SetParameter(ADC_ID, sizeof(uartTxBuffer), uartTxBuffer);
+    DataService_SetParameter(DS_STRING_ID, sizeof(uartTxBuffer), uartTxBuffer);
+    //Log_info2("######ADCBufCallback##### (%d) : %d", i, microVoltBuffer[1]);
+    /* Send out the data via UART */
+    UART_write(uart, uartTxBuffer, uartTxBufferOffset + 1);
+}
+
+
+void uartCallback(UART_Handle handle, void *buf, size_t count) {
+   return;
 }
 
 
@@ -850,22 +920,60 @@ static void user_handleButtonPress(button_state_t *pState)
   }
 }
 
-uint8_t Data_String[128];
+//uint8_t Data_String[128];
 
 static void ADCUpdate(UArg a0, UArg a1)
 {
-    ADC_Handle adc;
-    ADC_Params params;
-    ADC_Params_init(&params);
-    adc = ADC_open(Board_ADC0, &params);
-    if (adc == NULL) {
-        Log_error0("ADC_open failed");
+    ADCBuf_Handle adcBuf;
+    ADCBuf_Params adcBufParams;
+    ADCBuf_Conversion continuousConversion;
+
+
+
+    UART_Params uartParams;
+
+    UART_Params_init(&uartParams);
+    uartParams.writeDataMode = UART_DATA_BINARY;
+    uartParams.writeMode = UART_MODE_CALLBACK;
+    uartParams.writeCallback = uartCallback;
+    uartParams.baudRate = 115200;
+    uart = UART_open(Board_UART0, &uartParams);
+
+
+    /* Set up an ADCBuf peripheral in ADCBuf_RECURRENCE_MODE_CONTINUOUS */
+    ADCBuf_Params_init(&adcBufParams);
+    adcBufParams.callbackFxn = adcBufCallback;
+    adcBufParams.recurrenceMode = ADCBuf_RECURRENCE_MODE_CONTINUOUS;
+    adcBufParams.returnMode = ADCBuf_RETURN_MODE_CALLBACK;
+    adcBufParams.samplingFrequency = 500;
+    adcBuf = ADCBuf_open(CC2650_LAUNCHXL_ADCBuf0, &adcBufParams);
+
+    /* Configure the conversion struct */
+
+    continuousConversion.arg = NULL;
+    continuousConversion.adcChannel = 3;
+    continuousConversion.sampleBuffer = sampleBufferOne;
+    continuousConversion.sampleBufferTwo = sampleBufferTwo;
+    continuousConversion.samplesRequestedCount = ADCBUFFERSIZE;
+
+
+    if (!adcBuf){
+        Log_error0("ADCBuf_open failed");
     }
+
+    if (ADCBuf_convert(adcBuf, &continuousConversion, 1) !=
+            ADCBuf_STATUS_SUCCESS) {
+            System_abort("Did not start conversion process correctly\n");
+    }
+
+    Task_sleep(1000000000);
+
+    /*
     int_fast16_t res = 0;
     uint16_t adcValue = 0;
 
     //Log_info0("!!!!!!!!!ADCUpdate!!!!!!!!!");
-    Task_sleep(1000000);
+
     uint8_t counter = 0;
     uint8_t sendValue = 0;
     for(;;)
@@ -889,6 +997,7 @@ static void ADCUpdate(UArg a0, UArg a1)
             Task_sleep(1000000);
         }
     }
+    */
 }
 
 /*
